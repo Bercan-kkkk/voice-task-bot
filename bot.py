@@ -1,6 +1,6 @@
-"""Telegram-бот: голосовые и кружочки -> расшифровка -> чёткий список задач (Groq)."""
+"""Telegram-бот: голосовые и кружочки -> чёткий список задач (Google Gemini)."""
 import os, io, logging, datetime
-from groq import Groq
+import base64, httpx
 from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -9,18 +9,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-large-v3")
-LLM_MODELS = [m for m in os.getenv("GROQ_MODELS", "llama-3.3-70b-versatile,openai/gpt-oss-120b,llama-3.1-8b-instant").split(",") if m]
+MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-2.5-flash,gemini-flash-latest,gemini-2.0-flash").split(",") if m.strip()]
 WEBHOOK_BASE = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 PORT = int(os.getenv("PORT", "10000"))
 
-groq = Groq(api_key=GROQ_API_KEY)
 
-SYSTEM = """Ты — личный ассистент-менеджер. Тебе дают расшифровку голосового сообщения владельца (он надиктовывает мысли, планы, поток сознания).
-Твоя задача — превратить это в понятный план действий. Отвечай на русском, коротко и по делу, без воды.
+SYSTEM = """Ты — личный ассистент-менеджер. Тебе присылают голосовое/видео-кружочек владельца или текст (он надиктовывает мысли, планы, поток сознания).
+Сначала дай расшифровку речи, затем превратить это в понятный план действий. Отвечай на русском, коротко и по делу, без воды.
+Если это видео — учти и то, что видно на картинке.
 Формат ответа (используй HTML-теги Telegram: <b>, <i>; никаких markdown-звёздочек):
+
+<b>📝 Расшифровка</b>
+<i>дословно, что сказано</i>
 
 <b>🎯 Суть</b>
 1–2 предложения: о чём сообщение.
@@ -43,20 +45,20 @@ def allowed(update: Update) -> bool:
     return not ALLOWED or (update.effective_user and update.effective_user.id in ALLOWED)
 
 
-def transcribe(data: bytes, filename: str) -> str:
-    r = groq.audio.transcriptions.create(file=(filename, data), model=WHISPER_MODEL, language="ru", response_format="text")
-    return (r if isinstance(r, str) else getattr(r, "text", "")).strip()
-
-
-def analyze(text: str) -> str:
-    msgs = [{"role": "system", "content": SYSTEM.format(today=datetime.date.today().strftime("%d.%m.%Y, %A"))},
-            {"role": "user", "content": text}]
+def ask_gemini(text: str = "", data: bytes = b"", mime: str = "") -> str:
+    parts = [{"text": text or "Разбери это сообщение."}]
+    if data:
+        parts.insert(0, {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}})
+    body = {"system_instruction": {"parts": [{"text": SYSTEM.format(today=datetime.date.today().strftime("%d.%m.%Y, %A"))}]},
+            "contents": [{"role": "user", "parts": parts}], "generationConfig": {"temperature": 0.3}}
     last = None
-    for m in LLM_MODELS:
+    for m in MODELS:
         try:
-            r = groq.chat.completions.create(model=m.strip(), messages=msgs, temperature=0.3, max_tokens=1500)
-            return r.choices[0].message.content.strip()
-        except Exception as e:  # модель недоступна -> пробуем следующую
+            r = httpx.post(f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+                           params={"key": GEMINI_API_KEY}, json=body, timeout=120)
+            r.raise_for_status()
+            return "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"]).strip()
+        except Exception as e:
             log.warning("model %s failed: %s", m, e)
             last = e
     raise last
@@ -81,24 +83,20 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     msg = update.message
-    media, name = (msg.voice, "voice.ogg") if msg.voice else (msg.video_note, "circle.mp4") if msg.video_note else \
-                  (msg.audio, msg.audio.file_name or "audio.mp3") if msg.audio else (msg.video, "video.mp4")
+    media, mime = (msg.voice, "audio/ogg") if msg.voice else (msg.video_note, "video/mp4") if msg.video_note else \
+                  (msg.audio, msg.audio.mime_type or "audio/mpeg") if msg.audio else (msg.video, msg.video.mime_type or "video/mp4")
     await ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
     status = await msg.reply_text("🎧 Слушаю...")
     try:
         f = await media.get_file()
         buf = io.BytesIO()
         await f.download_to_memory(buf)
-        text = transcribe(buf.getvalue(), name)
-        if not text:
-            await status.edit_text("Не расслышал ничего 🤷 Попробуй ещё раз.")
-            return
-        await status.edit_text(f"📝 <i>{text[:3500]}</i>", parse_mode=ParseMode.HTML)
-        await ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
-        await reply_html(update, analyze(text))
+        answer = ask_gemini(msg.caption or "", buf.getvalue(), mime)
+        await status.delete()
+        await reply_html(update, answer)
     except Exception as e:
         log.exception("media error")
-        await msg.reply_text(f"⚠️ Ошибка: {e}")
+        await status.edit_text(f"⚠️ Ошибка: {e}")
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -106,7 +104,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await ctx.bot.send_chat_action(update.message.chat_id, ChatAction.TYPING)
     try:
-        await reply_html(update, analyze(update.message.text))
+        await reply_html(update, ask_gemini(update.message.text))
     except Exception as e:
         log.exception("text error")
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
